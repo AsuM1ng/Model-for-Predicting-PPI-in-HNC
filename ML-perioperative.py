@@ -1,286 +1,233 @@
-from sklearn.exceptions import ConvergenceWarning
+"""围手术期机器学习建模脚本。
 
-import os
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime
+构建 6 种模型：GLM、RF、SVM、NNET、GBM、XGBoost。
+- 使用 AUC、准确度、灵敏度、特异度、F1 评估模型；
+- AUC 为 100 次重复 10 折交叉验证均值；
+- 采用 Bootstrap(1000 次) 计算测试集 AUC 的置信区间；
+- 所有模型进行 SHAP 解释；
+- 所有长耗时流程均增加进度条。
+"""
 
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, f1_score
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import LinearSVC
-from sklearn.preprocessing import LabelEncoder
-from sklearn.naive_bayes import GaussianNB
-from sklearn.neural_network import MLPClassifier
-from sklearn.calibration import CalibratedClassifierCV
+from __future__ import annotations
 
-import xgboost as xgb
-import shap
-
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
-
+import json
 import warnings
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
+from pathlib import Path
+from typing import Dict, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+from sklearn.base import clone
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score, train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except Exception:
+    HAS_XGBOOST = False
 
 
-# =================== 数据 ===================
-if not os.path.exists("data1.csv"):
-    raise FileNotFoundError("未找到 data1.csv")
-
-data = pd.read_csv("data1.csv")
-
-features = [
-    'pre_op_palb', 'pre_op_alb', 'pre_op_hgb', 'pre_op_oropharyngeal_swab',
-    'pre_op_antibiotics', 'flap_type',
-    'post_op_pathology', 'ptnm_stage', 'multiple_primary',
-    'anastomotic_leak'
-]
-
-X = data[features].copy()
-y = data['wound_infection'].astype(int)
-
-X['flap_type'] = LabelEncoder().fit_transform(X['flap_type'].astype(str))
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.3, random_state=42, stratify=y
-)
+DATA_PATH = Path("data1.csv")
+FEATURE_JSON_CANDIDATES = [Path("mul_logistic_selected_features.json"), Path("lasso_results/selected_features.json")]
+OUTPUT_DIR = Path("ml_results")
+OUTPUT_DIR.mkdir(exist_ok=True)
+TARGET = "pulmonary_infection"
+TEST_SIZE = 0.3
+RANDOM_STATE = 42
+N_REPEATS = 100
+N_SPLITS = 10
+N_BOOTSTRAP = 1000
 
 
-# =================== 时间戳文件夹 ===================
-time_tag = datetime.now().strftime("%H-%M")
-FIG_DIR = f"results_figures_{time_tag}"
-os.makedirs(FIG_DIR, exist_ok=True)
+def load_feature_config() -> Tuple[str, list[str]]:
+    for path in FEATURE_JSON_CANDIDATES:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            features = payload.get("features") or payload.get("train_features") or []
+            if features:
+                return payload.get("target", TARGET), features
+    raise FileNotFoundError("未找到可用特征配置，请先运行 lasso.py 和 mul_logistic.py")
 
-# =================== 工具函数 ===================
-def calculate_metrics(y_true, y_prob, threshold=0.5):
+
+def calculate_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
     y_pred = (y_prob >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    return (
-        roc_auc_score(y_true, y_prob),
-        tp / (tp + fn) if (tp + fn) else 0,
-        tn / (tn + fp) if (tn + fp) else 0,
-        (tp + tn) / (tp + tn + fp + fn),
-        f1_score(y_true, y_pred)
-    )
-
-
-def calculate_net_benefit(y_true, y_prob, thresholds):
-    y_true = np.array(y_true)
-    net_benefits = []
-    n = len(y_true)
-    for pt in thresholds:
-        y_pred = (y_prob >= pt).astype(int)
-        tp = np.sum((y_pred == 1) & (y_true == 1))
-        fp = np.sum((y_pred == 1) & (y_true == 0))
-        nb = (tp / n) - (fp / n) * (pt / (1 - pt)) if 0 < pt < 1 else 0
-        net_benefits.append(nb)
-    return net_benefits
-
-
-def save_shap_summary(shap_values, X, model_name):
-    plt.figure()
-    shap.summary_plot(shap_values, X, show=False)
-    plt.tight_layout()
-    plt.savefig(f"{FIG_DIR}/SHAP_{model_name}_summary.png", dpi=300)
-    plt.close()
-
-
-def save_shap_bar(shap_values, X, model_name):
-    plt.figure()
-    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
-    plt.tight_layout()
-    plt.savefig(f"{FIG_DIR}/SHAP_{model_name}_bar.png", dpi=300)
-    plt.close()
-
-
-# =================== 中文显示 ===================
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
-
-
-
-# =================== 模型 ===================
-models = {
-    'GLM': LogisticRegression(class_weight='balanced', max_iter=1000),
-    'RF': RandomForestClassifier(class_weight='balanced', random_state=42),
-    'SVM': CalibratedClassifierCV(
-        LinearSVC(class_weight='balanced', dual=False, max_iter=10000),
-        cv=5
-    ),
-    'NNET': MLPClassifier(max_iter=500, random_state=42),
-    'NB': GaussianNB()
-}
-
-param_grids = {
-    'GLM': {'classifier__C': [1]},
-    'RF': {'classifier__n_estimators': [100], 'classifier__max_depth': [20]},
-    'SVM': {'classifier__estimator__C': [0.1, 1]},
-    'NNET': {'classifier__hidden_layer_sizes': [(50,), (100,)]},
-    'NB': {}
-}
-
-results = {}
-model_probs = {}
-CV = 5
-
-# =================== 训练 + SHAP ===================
-for name, model in models.items():
-    print(f"\n>>> 训练模型: {name}")
-
-    pipe = ImbPipeline([
-        ('smote', SMOTE(random_state=42)),
-        ('classifier', model)
-    ])
-
-    grid = GridSearchCV(pipe, param_grids[name], cv=CV, scoring='roc_auc', n_jobs=-1)
-    grid.fit(X_train, y_train)
-    best_model = grid.best_estimator_
-
-    y_prob = best_model.predict_proba(X_test)[:, 1]
-    model_probs[name] = y_prob
-
-    auc, sens, spec, acc, f1 = calculate_metrics(y_test, y_prob)
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-
-    results[name] = {
-        'AUC': auc,
-        'Sensitivity': sens,
-        'Specificity': spec,
-        'Accuracy': acc,
-        'F1': f1,
-        'fpr': fpr,
-        'tpr': tpr
+    return {
+        "auc": roc_auc_score(y_true, y_prob),
+        "accuracy": (tp + tn) / (tp + tn + fp + fn),
+        "sensitivity": tp / (tp + fn) if (tp + fn) else 0.0,
+        "specificity": tn / (tn + fp) if (tn + fp) else 0.0,
+        "f1": f1_score(y_true, y_pred),
     }
 
-    clf = best_model.named_steps['classifier']
-    X_bg = X_train.sample(min(100, len(X_train)), random_state=42)
-    X_exp = X_test.sample(min(50, len(X_test)), random_state=42)
 
+def bootstrap_auc_ci(model, X_train, y_train, X_test, y_test, n_bootstrap: int = N_BOOTSTRAP) -> Tuple[float, float]:
+    auc_scores = []
+    rng = np.random.default_rng(RANDOM_STATE)
+    for _ in tqdm(range(n_bootstrap), desc="Bootstrap 内部验证", leave=False):
+        idx = rng.integers(0, len(X_train), len(X_train))
+        X_boot = X_train.iloc[idx]
+        y_boot = y_train.iloc[idx]
+        boot_model = clone(model)
+        boot_model.fit(X_boot, y_boot)
+        y_prob = boot_model.predict_proba(X_test)[:, 1]
+        auc_scores.append(roc_auc_score(y_test, y_prob))
+    return float(np.percentile(auc_scores, 2.5)), float(np.percentile(auc_scores, 97.5))
+
+
+def save_shap_outputs(model, model_name: str, X_background: pd.DataFrame, X_explain: pd.DataFrame) -> None:
     try:
-        if name == 'RF':
-            explainer = shap.TreeExplainer(clf)
-            sv = explainer.shap_values(X_exp)[1]
-        elif name == 'GLM':
-            explainer = shap.LinearExplainer(clf, X_bg)
-            sv = explainer.shap_values(X_exp)
+        estimator = model.named_steps.get("model", model) if isinstance(model, Pipeline) else model
+        transformed_bg = model[:-1].transform(X_background) if isinstance(model, Pipeline) and len(model.steps) > 1 else X_background
+        transformed_exp = model[:-1].transform(X_explain) if isinstance(model, Pipeline) and len(model.steps) > 1 else X_explain
+
+        feature_names = list(X_background.columns)
+        transformed_bg = pd.DataFrame(transformed_bg, columns=feature_names)
+        transformed_exp = pd.DataFrame(transformed_exp, columns=feature_names)
+
+        if model_name in {"RF", "GBM", "XGBoost"}:
+            explainer = shap.TreeExplainer(estimator)
+            shap_values = explainer.shap_values(transformed_exp)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+        elif model_name == "GLM":
+            explainer = shap.LinearExplainer(estimator, transformed_bg)
+            shap_values = explainer.shap_values(transformed_exp)
         else:
-            explainer = shap.KernelExplainer(
-                lambda x: clf.predict_proba(pd.DataFrame(x, columns=X.columns))[:, 1],
-                X_bg
-            )
-            sv = explainer.shap_values(X_exp, nsamples=100)
+            explainer = shap.KernelExplainer(estimator.predict_proba, transformed_bg)
+            shap_values = explainer.shap_values(transformed_exp, nsamples=100)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
 
-        save_shap_summary(sv, X_exp, name)
-        save_shap_bar(sv, X_exp, name)
+        plt.figure()
+        shap.summary_plot(shap_values, transformed_exp, show=False)
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"shap_summary_{model_name}.png", dpi=300, bbox_inches="tight")
+        plt.close()
 
-    except Exception as e:
-        print(f"{name} SHAP 失败: {e}")
+        plt.figure()
+        shap.summary_plot(shap_values, transformed_exp, plot_type="bar", show=False)
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"shap_bar_{model_name}.png", dpi=300, bbox_inches="tight")
+        plt.close()
+    except Exception as exc:
+        print(f"[WARN] {model_name} 的 SHAP 解释失败：{exc}")
 
-# =================== XGBoost ===================
-print("\n>>> 训练模型: XGBoost")
-neg, pos = np.bincount(y_train)
-scale_pos_weight = neg / pos
 
-xgb_model = xgb.XGBClassifier(
-    eval_metric='logloss',
-    scale_pos_weight=scale_pos_weight,
-    random_state=42
-)
+def build_models() -> Dict[str, Pipeline]:
+    models: Dict[str, Pipeline] = {
+        "GLM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(max_iter=5000, solver="liblinear", random_state=RANDOM_STATE)),
+        ]),
+        "RF": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", RandomForestClassifier(n_estimators=500, random_state=RANDOM_STATE, class_weight="balanced")),
+        ]),
+        "SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        "NNET": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=3000, random_state=RANDOM_STATE)),
+        ]),
+        "GBM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", GradientBoostingClassifier(random_state=RANDOM_STATE)),
+        ]),
+    }
+    if HAS_XGBOOST:
+        models["XGBoost"] = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", XGBClassifier(
+                n_estimators=300,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                eval_metric="logloss",
+                random_state=RANDOM_STATE,
+            )),
+        ])
+    else:
+        print("[WARN] 当前环境缺少 xgboost，XGBoost 模型将被跳过。")
+    return models
 
-grid = GridSearchCV(
-    xgb_model,
-    {'n_estimators': [100], 'max_depth': [3, 5], 'learning_rate': [0.1]},
-    cv=CV,
-    scoring='roc_auc',
-    n_jobs=-1
-)
-grid.fit(X_train, y_train)
 
-clf = grid.best_estimator_
-y_prob = clf.predict_proba(X_test)[:, 1]
-model_probs['GBM'] = y_prob
+def main() -> None:
+    if not DATA_PATH.exists():
+        raise FileNotFoundError("未找到 data1.csv，请先运行 data_clean1.py")
 
-auc, sens, spec, acc, f1 = calculate_metrics(y_test, y_prob)
-fpr, tpr, _ = roc_curve(y_test, y_prob)
+    target, features = load_feature_config()
+    data = pd.read_csv(DATA_PATH)
 
-results['GBM'] = {
-    'AUC': auc,
-    'Sensitivity': sens,
-    'Specificity': spec,
-    'Accuracy': acc,
-    'F1': f1,
-    'fpr': fpr,
-    'tpr': tpr
-}
+    X = data[features].apply(pd.to_numeric, errors="coerce")
+    X = X.fillna(X.median(numeric_only=True))
+    y = pd.to_numeric(data[target], errors="coerce").fillna(0).astype(int)
 
-explainer = shap.TreeExplainer(clf)
-X_shap = X_test.sample(min(50, len(X_test)), random_state=42)
-sv = explainer.shap_values(X_shap)
-save_shap_summary(sv, X_shap, "GBM")
-save_shap_bar(sv, X_shap, "GBM")
-
-# =================== 指标表 ===================
-df = pd.DataFrame(results).T[['AUC', 'Sensitivity', 'Specificity', 'Accuracy', 'F1']]
-df.to_csv(f"{FIG_DIR}/model_metrics.csv", encoding="utf-8-sig")
-print("\n模型性能指标：\n", df.round(4))
-
-# =================== ROC ===================
-# plt.figure(figsize=(8, 6))
-# for k, v in results.items():
-#     plt.plot(v['fpr'], v['tpr'], label=k)
-# plt.plot([0, 1], [0, 1], 'k--')
-# plt.xlabel("1 - 特异性")
-# plt.ylabel("敏感性")
-# plt.title("ROC 曲线")
-# plt.legend()
-# plt.savefig(f"{FIG_DIR}/ROC_curves.png", dpi=300)
-# # plt.show()
-# =================== ROC（超圆角平滑版） ===================
-plt.figure(figsize=(8, 6))
-
-mean_fpr = np.linspace(0, 1, 3000)
-
-for k, v in results.items():
-    tpr_interp = np.interp(mean_fpr, v['fpr'], v['tpr'])
-
-    # 第一次平滑
-    window = 81
-    kernel = np.ones(window) / window
-    tpr_smooth = np.convolve(tpr_interp, kernel, mode='same')
-
-    # 第二次平滑（让转弯更圆）
-    tpr_smooth = np.convolve(tpr_smooth, kernel, mode='same')
-
-    # ROC 物理约束
-    tpr_smooth = np.maximum.accumulate(tpr_smooth)
-    tpr_smooth = np.clip(tpr_smooth, 0, 1)
-
-    plt.plot(
-        mean_fpr,
-        tpr_smooth,
-        label=f"{k} "
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
     )
 
-plt.plot([0, 1], [0, 1], 'k--', alpha=0.6)
-plt.xlabel("1 - 特异性")
-plt.ylabel("敏感性")
-plt.title("ROC 曲线")
-plt.legend()
-plt.tight_layout()
-plt.savefig(f"{FIG_DIR}/ROC_curves_extra_round.png", dpi=300)
-plt.close()
+    models = build_models()
+    performance_rows = []
 
-# =================== DCA ===================
-thresholds = np.linspace(0.05, 0.6, 50)
-plt.figure(figsize=(8, 6))
-for name, probs in model_probs.items():
-    plt.plot(thresholds, calculate_net_benefit(y_test, probs, thresholds), label=name)
-plt.xlabel("阈值概率")
-plt.ylabel("净受益")
-plt.title("DCA 曲线")
-plt.legend()
-plt.savefig(f"{FIG_DIR}/DCA_curves.png", dpi=300)
-# plt.show()
+    cv = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=RANDOM_STATE)
+
+    for model_name, model in tqdm(models.items(), desc="训练模型总进度"):
+        print(f"\n[INFO] 正在训练模型：{model_name}")
+
+        cv_scores = cross_val_score(
+            model,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring="roc_auc",
+            n_jobs=-1,
+        )
+        mean_cv_auc = float(np.mean(cv_scores))
+
+        model.fit(X_train, y_train)
+        y_prob = model.predict_proba(X_test)[:, 1]
+        metrics = calculate_metrics(y_test.to_numpy(), y_prob)
+        auc_ci_low, auc_ci_high = bootstrap_auc_ci(model, X_train, y_train, X_test, y_test)
+
+        performance_rows.append(
+            {
+                "model": model_name,
+                "cv_auc_mean": mean_cv_auc,
+                "test_auc": metrics["auc"],
+                "auc_ci_low": auc_ci_low,
+                "auc_ci_high": auc_ci_high,
+                "accuracy": metrics["accuracy"],
+                "sensitivity": metrics["sensitivity"],
+                "specificity": metrics["specificity"],
+                "f1": metrics["f1"],
+            }
+        )
+
+        bg = X_train.sample(min(100, len(X_train)), random_state=RANDOM_STATE)
+        ex = X_test.sample(min(50, len(X_test)), random_state=RANDOM_STATE)
+        save_shap_outputs(model, model_name, bg, ex)
+
+    performance_df = pd.DataFrame(performance_rows).sort_values("cv_auc_mean", ascending=False)
+    performance_df.to_csv(OUTPUT_DIR / "model_performance_summary.csv", index=False, encoding="utf-8-sig")
+    print("\n[INFO] 模型评估结果：")
+    print(performance_df)
+
+
+if __name__ == "__main__":
+    main()
